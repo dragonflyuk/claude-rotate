@@ -85,10 +85,12 @@ DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
 ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
 THRESHOLD = CFG.get("switch_threshold", 0.8)
 THRESHOLD_7D = CFG.get("switch_threshold_7d", 0.98)
-STRATEGY = CFG.get("strategy", "consume-first")  # or "least-used" / "most-weekly-left"
+STRATEGY = CFG.get("strategy", "consume-first")  # or "least-used" / "most-weekly-left" / "weekly-pace"
 COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
 SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
 SWITCH_MARGIN_7D = CFG.get("switch_margin_7d", 0.03)  # most-weekly-left hysteresis
+PACE_RATIO = CFG.get("pace_ratio", 1.25)  # weekly-pace hysteresis (multiplicative)
+RESERVE_SESSIONS = CFG.get("reserve_sessions", 1)  # weekly-pace: fresh 5h windows to keep
 CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
 
@@ -154,6 +156,23 @@ def weekly_reset(name: str) -> float:
     return STATE["accounts"].get(name, {}).get("reset_7d") or float("inf")
 
 
+def weekly_pace(name: str) -> float:
+    """Share of the weekly quota that must be used per hour from now on to not
+    lose any of it: weight * (1 - weekly util) / hours until the weekly reset.
+    Higher = more perishable. An unknown or passed reset counts as a full week;
+    the hours are floored at 1 so the score stays finite near the reset."""
+    left = max(0.0, 1.0 - util_7d(name))
+    reset = STATE["accounts"].get(name, {}).get("reset_7d")
+    now = time.time()
+    hours = (reset - now) / 3600 if reset and reset > now else 168.0
+    return ACCOUNTS[name].get("weight", 1.0) * left / max(hours, 1.0)
+
+
+def fresh_session(name: str) -> bool:
+    """5h window not started (or already reset) — a session to rotate into."""
+    return utilization(name) < 0.01
+
+
 def earliest_relief() -> float:
     """Soonest moment any account's 5h window resets (for hold-until-reset)."""
     now = time.time()
@@ -172,6 +191,8 @@ def pick_account() -> str:
     least-used: lowest 5h utilization.
     most-weekly-left: lowest weekly utilization (most weekly quota left), among
     accounts that still have 5h session room; ties broken by lower 5h use.
+    weekly-pace: highest weekly_pace() — the account whose remaining weekly
+    quota is likeliest to expire unused; ties broken by lower 5h use.
     If nothing is usable, the non-disabled account whose 5h window resets soonest.
     """
     under = [n for n in ACCOUNTS if usable(n)]
@@ -180,6 +201,8 @@ def pick_account() -> str:
             return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
         if STRATEGY == "most-weekly-left":
             return min(under, key=lambda n: (priority(n), util_7d(n), utilization(n)))
+        if STRATEGY == "weekly-pace":
+            return min(under, key=lambda n: (priority(n), -weekly_pace(n), utilization(n)))
         return min(under, key=lambda n: (priority(n), utilization(n)))
     pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
     return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
@@ -264,6 +287,17 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                         # quota left; the margin stops near-equal accounts churning
                         # (each switch costs the warm prompt cache).
                         reason = "most_weekly_left"
+                    elif (STRATEGY == "weekly-pace"
+                          and weekly_pace(nxt) >= weekly_pace(account) * PACE_RATIO
+                          and (not fresh_session(nxt)
+                               or sum(fresh_session(n) and usable(n)
+                                      for n in ACCOUNTS if n not in (account, nxt))
+                               >= RESERVE_SESSIONS)):
+                        # Proactively move to clearly more perishable quota — but a
+                        # voluntary move must not start the last fresh 5h windows:
+                        # those are kept as somewhere to rotate into when the active
+                        # session runs out. Forced switches above may still use them.
+                        reason = "weekly_pace"
             if reason:
                 STATE["active_account"] = nxt
                 STATE["last_switch_ts"] = now
@@ -320,6 +354,8 @@ async def rotate_status(request: Request):
             info["reset_5h_in_min"] = max(0, round((info["reset_5h"] - now) / 60))
         if info.get("reset_7d"):
             info["reset_7d_in_h"] = max(0, round((info["reset_7d"] - now) / 3600, 1))
+        info["weekly_pace_pct_per_h"] = round(weekly_pace(name) * 100, 3)
+        info["fresh_session"] = fresh_session(name)
         accounts[name] = info
     return {
         "active_account": STATE["active_account"],

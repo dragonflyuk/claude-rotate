@@ -36,6 +36,7 @@ R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}, "c": {"name": "c"}}
 R.THRESHOLD, R.THRESHOLD_7D = 0.8, 0.98
 R.STRATEGY, R.COOLDOWN_S, R.SWITCH_MARGIN, R.CF_MARGIN_S = "consume-first", 300, 0.05, 3600
 R.SWITCH_MARGIN_7D = 0.03
+R.PACE_RATIO, R.RESERVE_SESSIONS = 1.25, 1
 run = asyncio.run
 now = time.time()
 PASS = 0
@@ -90,6 +91,59 @@ fresh_state("a")
 R.STATE["accounts"] = {"a": {"util_5h": 0.85, "util_7d": 0.1}, "b": {"util_5h": 0.1, "util_7d": 0.6}, "c": {"util_5h": 0.9, "util_7d": 0.9}}
 v = run(R.note_response("a", headers(u5=0.85, u7=0.1), 200))
 check("most-weekly-left leaves account when its session is spent", v == "switched" and R.STATE["active_account"] == "b")
+R.STRATEGY = "consume-first"
+
+# 1f. weekly-pace: most perishable remaining quota wins, not just most left
+H_ = 3600
+R.STRATEGY = "weekly-pace"
+fresh_state("a")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.2, "util_7d": 0.40, "reset_7d": now + 120 * H_},  # 0.60/120h = 0.5%/h
+    "b": {"util_5h": 0.2, "util_7d": 0.85, "reset_7d": now + 6 * H_},    # 0.15/6h  = 2.5%/h
+    "c": {"util_5h": 0.2, "util_7d": 0.10, "reset_7d": now + 160 * H_},  # 0.90/160h = 0.56%/h
+}
+check("weekly-pace picks quota about to expire", R.pick_account() == "b")
+R.STATE["accounts"]["b"]["util_5h"] = 0.9
+check("weekly-pace skips 5h-spent account", R.pick_account() == "c")
+check("weekly_pace math", abs(R.weekly_pace("a") - 0.6 / 120) < 1e-4)
+R.ACCOUNTS["a"]["weight"] = 4  # e.g. a 20x plan next to 5x plans
+check("weekly-pace honours account weight", R.pick_account() == "a")
+del R.ACCOUNTS["a"]["weight"]
+# 1g. proactive switch needs the ratio margin
+fresh_state("a")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.2, "util_7d": 0.5, "reset_7d": now + 100 * H_},  # 0.5%/h
+    "b": {"util_5h": 0.3, "util_7d": 0.4, "reset_7d": now + 100 * H_},  # 0.6%/h (1.2x)
+    "c": {"util_5h": 0.9, "util_7d": 0.0, "reset_7d": now + 100 * H_},
+}
+v = run(R.note_response("a", headers(u5=0.2, u7=0.5), 200))
+check("weekly-pace ratio margin prevents churn", v is None and R.STATE["active_account"] == "a")
+R.STATE["accounts"]["b"]["util_7d"] = 0.3  # 0.7%/h (1.4x), b already mid-session
+v = run(R.note_response("a", headers(u5=0.2, u7=0.5), 200))
+check("weekly-pace proactive switch", v == "switched" and R.STATE["active_account"] == "b")
+check("event reason weekly_pace", R.STATE["events"][-1]["reason"] == "weekly_pace")
+# 1h. reserve: a voluntary switch may not start the last fresh 5h window
+fresh_state("a")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.2, "util_7d": 0.5, "reset_7d": now + 100 * H_},
+    "b": {"util_5h": 0.0, "util_7d": 0.0, "reset_7d": now + 100 * H_},  # fresh, 2x pace
+    "c": {"util_5h": 0.5, "util_7d": 0.9, "reset_7d": now + 100 * H_},  # not fresh
+}
+v = run(R.note_response("a", headers(u5=0.2, u7=0.5), 200))
+check("weekly-pace keeps last fresh session in reserve", v is None and R.STATE["active_account"] == "a")
+R.STATE["accounts"]["c"]["reset_5h"] = now - 10  # c's window resets -> second fresh session
+v = run(R.note_response("a", headers(u5=0.2, u7=0.5), 200))
+check("weekly-pace starts a fresh session when another stays in reserve",
+      v == "switched" and R.STATE["active_account"] == "b")
+# 1i. forced switch (5h spent) may use the reserve
+fresh_state("a")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.85, "util_7d": 0.5, "reset_7d": now + 100 * H_},
+    "b": {"util_5h": 0.0, "util_7d": 0.2, "reset_7d": now + 100 * H_},
+    "c": {"util_5h": 0.9, "util_7d": 0.0, "reset_7d": now + 100 * H_},
+}
+v = run(R.note_response("a", headers(u5=0.85, u7=0.5), 200))
+check("weekly-pace forced switch uses reserve session", v == "switched" and R.STATE["active_account"] == "b")
 R.STRATEGY = "consume-first"
 
 # 2. burst 429 (util well under 1.0, no rejected status) → pace, no rotation

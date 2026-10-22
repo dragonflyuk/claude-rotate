@@ -85,9 +85,10 @@ DEVICE_BY_KEY = {v: k for k, v in CFG["devices"].items()}
 ACCOUNTS = {a["name"]: a for a in CFG["accounts"]}
 THRESHOLD = CFG.get("switch_threshold", 0.8)
 THRESHOLD_7D = CFG.get("switch_threshold_7d", 0.98)
-STRATEGY = CFG.get("strategy", "consume-first")  # or "least-used"
+STRATEGY = CFG.get("strategy", "consume-first")  # or "least-used" / "most-weekly-left"
 COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
 SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
+SWITCH_MARGIN_7D = CFG.get("switch_margin_7d", 0.03)  # most-weekly-left hysteresis
 CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
 
@@ -169,12 +170,16 @@ def pick_account() -> str:
     consume-first (default): burn the usable account whose weekly window resets
     soonest — weekly quota is use-it-or-lose-it, so spend the perishable one.
     least-used: lowest 5h utilization.
+    most-weekly-left: lowest weekly utilization (most weekly quota left), among
+    accounts that still have 5h session room; ties broken by lower 5h use.
     If nothing is usable, the non-disabled account whose 5h window resets soonest.
     """
     under = [n for n in ACCOUNTS if usable(n)]
     if under:
         if STRATEGY == "consume-first":
             return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
+        if STRATEGY == "most-weekly-left":
+            return min(under, key=lambda n: (priority(n), util_7d(n), utilization(n)))
         return min(under, key=lambda n: (priority(n), utilization(n)))
     pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
     return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
@@ -253,6 +258,12 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                         # Use-it-or-lose-it: proactively jump to an account whose
                         # weekly window expires clearly sooner than the active one's.
                         reason = "consume_first"
+                    elif (STRATEGY == "most-weekly-left"
+                          and util_7d(nxt) <= util_7d(account) - SWITCH_MARGIN_7D):
+                        # Proactively move to the account with clearly more weekly
+                        # quota left; the margin stops near-equal accounts churning
+                        # (each switch costs the warm prompt cache).
+                        reason = "most_weekly_left"
             if reason:
                 STATE["active_account"] = nxt
                 STATE["last_switch_ts"] = now

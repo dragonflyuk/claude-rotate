@@ -352,9 +352,10 @@ upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 | `accounts[].disabled` | `true` benches an account: never rotated onto, still shown in the panel |
 | `switch_threshold` | 5h-window utilization that triggers rotation (default 0.8) |
 | `switch_threshold_7d` | weekly-window utilization that makes an account unusable (default 0.98) |
-| `strategy` | `consume-first` (default) or `least-used` — see below |
+| `strategy` | `consume-first` (default), `least-used` or `most-weekly-left` — see below |
 | `switch_cooldown_s` | min seconds between voluntary switches (default 300); hard limits ignore it |
 | `switch_margin` | hysteresis: a threshold switch needs a candidate this much better (default 0.05) |
+| `switch_margin_7d` | `most-weekly-left` proactive switch only if the candidate's weekly utilization is this much lower (default 0.03) |
 | `consume_first_margin_s` | proactive switch only if the candidate's weekly reset is this much sooner (default 3600) |
 | `hold_max_s` | when *every* account is spent, hold the request open up to this long waiting for a window reset instead of returning 429 (default 0 = off) |
 | `prices_per_mtok` | substring-matched `[input, output]` $ per MTok for the cost columns |
@@ -372,6 +373,11 @@ weekly window under `switch_threshold_7d`; a window past its reset counts as
   switches *proactively* (below the threshold) when another usable account's
   weekly reset is at least `consume_first_margin_s` sooner.
 - **`least-used`**: classic — lowest 5h utilization wins.
+- **`most-weekly-left`**: among accounts with 5h room, the one with the
+  **lowest weekly utilization** wins (ties go to lower 5h use). The proxy
+  switches *proactively* when another usable account's weekly utilization is
+  at least `switch_margin_7d` lower, so weekly usage stays balanced and a
+  5h-spent account is left for the one with the most week remaining.
 - A cooldown plus a hysteresis margin stop accounts ping-ponging at the
   threshold; a hard limit (quota actually rejected) always switches
   immediately.
@@ -417,7 +423,8 @@ config, the proxy abandons it on the next response, cooldown or not. Re-enable
 by deleting the flag; both changes need a restart (hot reload is on the roadmap).
 
 Combine with `strategy` for the remaining temperament choice: `consume-first`
-(spend perishable weekly quota first) or `least-used` (spread evenly).
+(spend perishable weekly quota first), `least-used` (spread evenly) or
+`most-weekly-left` (always ride the account with the most weekly quota left).
 
 **Design note — why no rules YAML:** a rules engine (per-model routes,
 time-of-day windows, per-device pinning) would add a parser, a second config

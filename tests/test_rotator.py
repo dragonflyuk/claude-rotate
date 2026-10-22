@@ -35,6 +35,7 @@ def fresh_state(active="a"):
 R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}, "c": {"name": "c"}}
 R.THRESHOLD, R.THRESHOLD_7D = 0.8, 0.98
 R.STRATEGY, R.COOLDOWN_S, R.SWITCH_MARGIN, R.CF_MARGIN_S = "consume-first", 300, 0.05, 3600
+R.SWITCH_MARGIN_7D = 0.03
 run = asyncio.run
 now = time.time()
 PASS = 0
@@ -63,6 +64,32 @@ check("consume-first skips 5h-exhausted account", R.pick_account() == "c")
 # 1c. least-used strategy picks lowest 5h util
 R.STRATEGY = "least-used"
 check("least-used picks lowest 5h util", R.pick_account() == "c")
+R.STRATEGY = "consume-first"
+
+# 1d. most-weekly-left picks lowest weekly util among 5h-usable accounts
+R.STRATEGY = "most-weekly-left"
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.1, "util_7d": 0.3},
+    "b": {"util_5h": 0.9, "util_7d": 0.05},  # most weekly left but 5h session spent
+    "c": {"util_5h": 0.5, "util_7d": 0.2},
+}
+check("most-weekly-left picks most weekly left with session room", R.pick_account() == "c")
+R.STATE["accounts"]["b"]["reset_5h"] = now - 10  # b's session window has reset
+check("most-weekly-left uses account once its 5h window resets", R.pick_account() == "b")
+# 1e. proactive switch below threshold, gated by weekly margin
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"util_5h": 0.2, "util_7d": 0.5}, "b": {"util_5h": 0.6, "util_7d": 0.3}, "c": {"util_5h": 0.9, "util_7d": 0.9}}
+v = run(R.note_response("a", headers(u5=0.2, u7=0.5), 200))
+check("most-weekly-left proactive switch", v == "switched" and R.STATE["active_account"] == "b")
+check("event reason most_weekly_left", R.STATE["events"][-1]["reason"] == "most_weekly_left")
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"util_5h": 0.2, "util_7d": 0.32}, "b": {"util_5h": 0.2, "util_7d": 0.30}, "c": {"util_5h": 0.9, "util_7d": 0.9}}
+v = run(R.note_response("a", headers(u5=0.2, u7=0.32), 200))
+check("most-weekly-left margin prevents churn", v is None and R.STATE["active_account"] == "a")
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"util_5h": 0.85, "util_7d": 0.1}, "b": {"util_5h": 0.1, "util_7d": 0.6}, "c": {"util_5h": 0.9, "util_7d": 0.9}}
+v = run(R.note_response("a", headers(u5=0.85, u7=0.1), 200))
+check("most-weekly-left leaves account when its session is spent", v == "switched" and R.STATE["active_account"] == "b")
 R.STRATEGY = "consume-first"
 
 # 2. burst 429 (util well under 1.0, no rejected status) → pace, no rotation

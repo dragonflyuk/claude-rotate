@@ -357,7 +357,8 @@ upstream `anthropic-ratelimit-unified-*` headers for per-request telemetry.
 | `switch_margin` | hysteresis: a threshold switch needs a candidate this much better (default 0.05) |
 | `switch_margin_7d` | `most-weekly-left` proactive switch only if the candidate's weekly utilization is this much lower (default 0.03) |
 | `pace_ratio` | `weekly-pace` proactive switch only if the candidate's pace is this many times the active account's (default 1.25) |
-| `reserve_sessions` | `weekly-pace`: a proactive switch never leaves fewer than this many other accounts with an unstarted 5h window (default 1) |
+| `reserve_sessions` | `weekly-pace`: a proactive switch onto a fresh 5h window needs at least this many other accounts (the one being left counts) with room to rotate into (default 1) |
+| `reserve_headroom` | room an account needs left in both its 5h and weekly windows, below their thresholds, to count as somewhere to rotate into (default 0.03) |
 | `accounts[].weight` | `weekly-pace`: relative size of the account's plan, e.g. 4 for a 20x plan beside 5x plans (default 1) |
 | `consume_first_margin_s` | proactive switch only if the candidate's weekly reset is this much sooner (default 3600) |
 | `hold_max_s` | when *every* account is spent, hold the request open up to this long waiting for a window reset instead of returning 429 (default 0 = off) |
@@ -386,11 +387,14 @@ weekly window under `switch_threshold_7d`; a window past its reset counts as
   reset`: the rate it must be used at from now on so none of it expires.
   The highest score among accounts with 5h room wins, so quota close to
   expiring gets spent first. A proactive switch needs a score at least
-  `pace_ratio` times the active account's, and it never starts a fresh 5h
-  window if that would leave fewer than `reserve_sessions` other fresh windows,
-  so there is always a session to rotate into. Forced switches (5h spent,
+  `pace_ratio` times the active account's, and it only starts a fresh 5h
+  window if at least `reserve_sessions` other accounts (the one being left
+  included) still have `reserve_headroom` in both windows, so there is always
+  somewhere to rotate into. Forced switches (5h spent,
   quota rejected) can use the reserve. `/rotate/status` shows each account's
   `weekly_pace_pct_per_h` and `fresh_session`.
+- If nothing is usable, the proxy waits on the account whose 5h window resets
+  soonest, skipping week-exhausted accounts (a 5h reset can't help them).
 - A cooldown plus a hysteresis margin stop accounts ping-ponging at the
   threshold; a hard limit (quota actually rejected) always switches
   immediately.

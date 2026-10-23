@@ -90,7 +90,8 @@ COOLDOWN_S = CFG.get("switch_cooldown_s", 300)
 SWITCH_MARGIN = CFG.get("switch_margin", 0.05)
 SWITCH_MARGIN_7D = CFG.get("switch_margin_7d", 0.03)  # most-weekly-left hysteresis
 PACE_RATIO = CFG.get("pace_ratio", 1.25)  # weekly-pace hysteresis (multiplicative)
-RESERVE_SESSIONS = CFG.get("reserve_sessions", 1)  # weekly-pace: fresh 5h windows to keep
+RESERVE_SESSIONS = CFG.get("reserve_sessions", 1)  # weekly-pace: fallbacks to keep
+RESERVE_HEADROOM = CFG.get("reserve_headroom", 0.03)  # room a fallback needs in both windows
 CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
 
@@ -173,6 +174,13 @@ def fresh_session(name: str) -> bool:
     return utilization(name) < 0.01
 
 
+def can_fall_back_to(name: str) -> bool:
+    """Somewhere to rotate into: usable, with real room left in both windows."""
+    return (usable(name)
+            and THRESHOLD - utilization(name) >= RESERVE_HEADROOM
+            and THRESHOLD_7D - util_7d(name) >= RESERVE_HEADROOM)
+
+
 def earliest_relief() -> float:
     """Soonest moment any account's 5h window resets (for hold-until-reset)."""
     now = time.time()
@@ -193,7 +201,9 @@ def pick_account() -> str:
     accounts that still have 5h session room; ties broken by lower 5h use.
     weekly-pace: highest weekly_pace() — the account whose remaining weekly
     quota is likeliest to expire unused; ties broken by lower 5h use.
-    If nothing is usable, the non-disabled account whose 5h window resets soonest.
+    If nothing is usable: the non-disabled account whose 5h window resets
+    soonest, skipping week-exhausted accounts (a 5h reset doesn't help them);
+    if every account is week-exhausted, the one whose weekly window resets soonest.
     """
     under = [n for n in ACCOUNTS if usable(n)]
     if under:
@@ -205,7 +215,10 @@ def pick_account() -> str:
             return min(under, key=lambda n: (priority(n), -weekly_pace(n), utilization(n)))
         return min(under, key=lambda n: (priority(n), utilization(n)))
     pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
-    return min(pool, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
+    week_ok = [n for n in pool if util_7d(n) < THRESHOLD_7D]
+    if week_ok:
+        return min(week_ok, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
+    return min(pool, key=weekly_reset)
 
 
 async def note_response(account: str, headers: httpx.Headers, status: int) -> str | None:
@@ -290,13 +303,13 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                     elif (STRATEGY == "weekly-pace"
                           and weekly_pace(nxt) >= weekly_pace(account) * PACE_RATIO
                           and (not fresh_session(nxt)
-                               or sum(fresh_session(n) and usable(n)
-                                      for n in ACCOUNTS if n not in (account, nxt))
+                               or sum(can_fall_back_to(n) for n in ACCOUNTS if n != nxt)
                                >= RESERVE_SESSIONS)):
                         # Proactively move to clearly more perishable quota — but a
-                        # voluntary move must not start the last fresh 5h windows:
-                        # those are kept as somewhere to rotate into when the active
-                        # session runs out. Forced switches above may still use them.
+                        # voluntary move must not start a fresh 5h window unless
+                        # somewhere else (the account being left counts) still has
+                        # room to rotate into when the new session runs out. Forced
+                        # switches above may always use the reserve.
                         reason = "weekly_pace"
             if reason:
                 STATE["active_account"] = nxt

@@ -122,19 +122,33 @@ R.STATE["accounts"]["b"]["util_7d"] = 0.3  # 0.7%/h (1.4x), b already mid-sessio
 v = run(R.note_response("a", headers(u5=0.2, u7=0.5), 200))
 check("weekly-pace proactive switch", v == "switched" and R.STATE["active_account"] == "b")
 check("event reason weekly_pace", R.STATE["events"][-1]["reason"] == "weekly_pace")
-# 1h. reserve: a voluntary switch may not start the last fresh 5h window
+R.RESERVE_HEADROOM = 0.03
+# 1h. reserve: a voluntary switch may not start a fresh 5h window unless
+# somewhere else (the account being left counts) still has room
 fresh_state("a")
 R.STATE["accounts"] = {
-    "a": {"util_5h": 0.2, "util_7d": 0.5, "reset_7d": now + 100 * H_},
-    "b": {"util_5h": 0.0, "util_7d": 0.0, "reset_7d": now + 100 * H_},  # fresh, 2x pace
-    "c": {"util_5h": 0.5, "util_7d": 0.9, "reset_7d": now + 100 * H_},  # not fresh
+    "a": {"util_5h": 0.78, "util_7d": 0.5, "reset_7d": now + 100 * H_},  # 5h nearly spent
+    "b": {"util_5h": 0.0, "util_7d": 0.0, "reset_7d": now + 100 * H_},   # fresh, top pace
+    "c": {"util_5h": 0.5, "util_7d": 0.97, "reset_7d": now + 100 * H_},  # week spent
 }
-v = run(R.note_response("a", headers(u5=0.2, u7=0.5), 200))
-check("weekly-pace keeps last fresh session in reserve", v is None and R.STATE["active_account"] == "a")
-R.STATE["accounts"]["c"]["reset_5h"] = now - 10  # c's window resets -> second fresh session
-v = run(R.note_response("a", headers(u5=0.2, u7=0.5), 200))
-check("weekly-pace starts a fresh session when another stays in reserve",
+v = run(R.note_response("a", headers(u5=0.78, u7=0.5), 200))
+check("weekly-pace keeps fresh session when nothing else has room", v is None and R.STATE["active_account"] == "a")
+R.STATE["accounts"]["c"]["util_7d"] = 0.9  # c has weekly room again -> a fallback exists
+v = run(R.note_response("a", headers(u5=0.78, u7=0.5), 200))
+check("weekly-pace starts fresh session when another account has room",
       v == "switched" and R.STATE["active_account"] == "b")
+# 1h2. the account being left counts as a fallback (live case 2026-10-23:
+# active at 93% week, other account week-spent, freshly reset account idle)
+fresh_state("b")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.0, "util_7d": 0.98, "reset_7d": now + 80 * H_},
+    "b": {"util_5h": 0.06, "util_7d": 0.93, "reset_7d": now + 85 * H_},
+    "c": {"util_5h": 0.0, "util_7d": 1.03, "reset_7d": now - 3600},  # weekly window reset
+}
+check("week-reset account scores highest", R.pick_account() == "c")
+v = run(R.note_response("b", headers(u5=0.06, u7=0.93), 200))
+check("weekly-pace switches to freshly reset account, leaving active as fallback",
+      v == "switched" and R.STATE["active_account"] == "c")
 # 1i. forced switch (5h spent) may use the reserve
 fresh_state("a")
 R.STATE["accounts"] = {
@@ -144,6 +158,20 @@ R.STATE["accounts"] = {
 }
 v = run(R.note_response("a", headers(u5=0.85, u7=0.5), 200))
 check("weekly-pace forced switch uses reserve session", v == "switched" and R.STATE["active_account"] == "b")
+R.STRATEGY = "consume-first"
+
+# 1j. all-unusable fallback skips week-exhausted accounts (live case
+# 2026-10-22 21:16: rotated onto a 103%-week account and was rejected)
+R.STRATEGY = "weekly-pace"
+fresh_state("b")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.07, "util_7d": 0.98, "reset_5h": now + 9000, "reset_7d": now + 300000},
+    "b": {"util_5h": 0.98, "util_7d": 0.60, "reset_5h": now + 7000, "reset_7d": now + 400000},
+    "c": {"util_5h": 0.0, "util_7d": 1.03, "reset_5h": now - 10, "reset_7d": now + 90000},
+}
+check("fallback skips week-exhausted accounts", R.pick_account() == "b")
+R.STATE["accounts"]["b"]["util_7d"] = 0.99
+check("fallback with every week spent picks soonest weekly reset", R.pick_account() == "c")
 R.STRATEGY = "consume-first"
 
 # 2. burst 429 (util well under 1.0, no rejected status) → pace, no rotation

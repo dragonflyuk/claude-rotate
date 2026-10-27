@@ -37,6 +37,7 @@ R.THRESHOLD, R.THRESHOLD_7D = 0.8, 0.98
 R.STRATEGY, R.COOLDOWN_S, R.SWITCH_MARGIN, R.CF_MARGIN_S = "consume-first", 300, 0.05, 3600
 R.SWITCH_MARGIN_7D = 0.03
 R.PACE_RATIO, R.RESERVE_SESSIONS = 1.25, 1
+R.HARD_LIMIT, R.RESERVE_SPEND_5H_S, R.RESERVE_SPEND_7D_S = 1.0, 3600, 43200
 run = asyncio.run
 now = time.time()
 PASS = 0
@@ -171,6 +172,11 @@ R.STATE["accounts"] = {
 }
 check("fallback skips week-exhausted accounts", R.pick_account() == "b")
 R.STATE["accounts"]["b"]["util_7d"] = 0.99
+# b's binding window is now the week (1% left, resets in 400000s); a's week
+# (2% left) resets sooner — still reserve, so no early stop
+check("emergency reserve picks soonest binding reset", R.pick_account() == "a")
+R.STATE["accounts"]["a"]["util_7d"] = 1.0
+R.STATE["accounts"]["b"]["util_7d"] = 1.01
 check("fallback with every week spent picks soonest weekly reset", R.pick_account() == "c")
 R.STRATEGY = "consume-first"
 
@@ -206,6 +212,11 @@ R.STATE["accounts"] = {
 v = run(R.note_response("a", headers(u5=1.0, status="rejected"), 429))
 # fallback pick = earliest 5h reset = c; c != a so it switches (bounce toward relief)
 check("all-spent quota hit still moves toward earliest reset", v == "switched" and R.STATE["active_account"] == "c")
+v = run(R.note_response("c", headers(u5=0.9, status="rejected"), 429))
+# b at 95% is reserve, not spent: rejected c must hand over, not 429 the client
+check("rejected account hands over to remaining reserve", v == "switched" and R.STATE["active_account"] == "b")
+v = run(R.note_response("b", headers(u5=0.95, status="rejected"), 429))
+check("all rejected: bounce to soonest relief", v == "switched" and R.STATE["active_account"] == "c")
 v = run(R.note_response("c", headers(u5=0.9, status="rejected"), 429))
 check("exhausted when fallback is itself", v == "exhausted")
 check("earliest_relief is soonest reset", abs(R.earliest_relief() - (now + 500)) < 5)
@@ -301,5 +312,55 @@ R.STATE["accounts"] = {"a": {"util_5h": 1.0, "reset_5h": now + 10},
                        "b": {"util_5h": 1.0, "reset_5h": now + 100},
                        "c": {"util_5h": 1.0, "reset_5h": now + 50}}
 check("fallback skips disabled", R.pick_account() == "c")
+
+R.ACCOUNTS = {"a": {"name": "a"}, "b": {"name": "b"}, "c": {"name": "c"}}
+
+# 12. reserve band (live: everything stopped at 98%; 2026-10-18 17:50 bounced
+# onto rejected accounts while another still had room)
+R.THRESHOLD, R.THRESHOLD_7D, R.STRATEGY = 0.95, 0.95, "weekly-pace"
+fresh_state("a")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.97, "util_7d": 0.3, "reset_5h": now + 9000, "reset_7d": now + 300000},
+    "b": {"util_5h": 0.96, "util_7d": 0.2, "reset_5h": now + 5000, "reset_7d": now + 300000},
+    "c": {"util_5h": 0.5, "util_7d": 0.99, "reset_5h": now + 5000, "reset_7d": now + 200000},
+}
+check("reserve not spendable far from reset", not R.reserve_spendable("a") and not R.usable("a"))
+check("emergency uses reserve, soonest binding reset", R.pick_account() == "b")
+v = run(R.note_response("a", headers(u5=0.97), 200))
+check("emergency: active keeps warm cache instead of hopping reserve", v is None and R.STATE["active_account"] == "a")
+v = run(R.note_response("a", headers(u5=1.0, status="rejected"), 429))
+check("rejected active moves into reserve", v == "switched" and R.STATE["active_account"] == "b")
+check("rejected account not hard_ok", not R.hard_ok("a"))
+R.STATE["accounts"]["a"]["last_seen"] = time.time() - 60
+R.STATE["accounts"]["a"]["reset_5h"] = time.time() - 1
+check("rejection forgotten once its window resets", R.hard_ok("a") and R.usable("a"))
+
+# 12b. reserve whose window resets soon is spent first, even proactively
+fresh_state("a")
+R.STATE["accounts"] = {
+    "a": {"util_5h": 0.2, "util_7d": 0.3, "reset_5h": now + 15000, "reset_7d": now + 300000},
+    "b": {"util_5h": 0.97, "util_7d": 0.2, "reset_5h": now + 1800, "reset_7d": now + 300000},
+    "c": {"util_5h": 0.1, "util_7d": 0.1, "reset_5h": now + 15000, "reset_7d": now + 300000},
+}
+check("5h reserve near reset is spendable", R.reserve_spendable("b"))
+check("expiring reserve picked first", R.pick_account() == "b")
+v = run(R.note_response("a", headers(u5=0.2), 200))
+check("proactive switch to expiring reserve", v == "switched" and R.STATE["active_account"] == "b"
+      and R.STATE["events"][-1]["reason"] == "reserve_expiring")
+v = run(R.note_response("b", headers(u5=0.99), 200))
+check("expiring reserve used past the threshold", v is None and R.STATE["active_account"] == "b")
+R.STATE["last_switch_ts"] = 0
+v = run(R.note_response("b", headers(u5=1.0, status="rejected"), 429))
+check("spent reserve returns to normal pick", v == "switched" and R.STATE["active_account"] != "b")
+
+# 12c. weekly reserve: spendable within the 7d horizon only if the 5h window
+# is not also holding it
+fresh_state("a")
+R.STATE["accounts"] = {"a": {"util_5h": 0.3, "util_7d": 0.97, "reset_5h": now + 9000,
+                             "reset_7d": now + 20000}}
+check("7d reserve near weekly reset is spendable", R.reserve_spendable("a"))
+R.STATE["accounts"]["a"]["util_5h"] = 0.96
+check("...not while 5h reserve is far from its reset", not R.reserve_spendable("a"))
+R.THRESHOLD, R.THRESHOLD_7D, R.STRATEGY = 0.8, 0.98, "consume-first"
 
 print(f"\nall {PASS} checks passed")

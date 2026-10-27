@@ -93,6 +93,13 @@ PACE_RATIO = CFG.get("pace_ratio", 1.25)  # weekly-pace hysteresis (multiplicati
 RESERVE_SESSIONS = CFG.get("reserve_sessions", 1)  # weekly-pace: fallbacks to keep
 RESERVE_HEADROOM = CFG.get("reserve_headroom", 0.03)  # room a fallback needs in both windows
 CF_MARGIN_S = CFG.get("consume_first_margin_s", 3600)
+# Above the switch thresholds an account is held in reserve, not dropped: it
+# stays usable up to HARD_LIMIT (Anthropic rejects at 1.0) for emergencies
+# (nothing else under its thresholds) and is spent on purpose once the window
+# holding it there resets within the spend horizon (use it or lose it).
+HARD_LIMIT = CFG.get("hard_limit", 1.0)
+RESERVE_SPEND_5H_S = CFG.get("reserve_spend_5h_s", 3600)
+RESERVE_SPEND_7D_S = CFG.get("reserve_spend_7d_s", 43200)
 HOLD_MAX_S = CFG.get("hold_max_s", 0)  # 0 = return 429 when every account is spent
 
 
@@ -148,9 +155,56 @@ def disabled(name: str) -> bool:
     return bool(ACCOUNTS[name].get("disabled"))
 
 
-def usable(name: str) -> bool:
+def under_threshold(name: str) -> bool:
     return (not disabled(name)
             and utilization(name) < THRESHOLD and util_7d(name) < THRESHOLD_7D)
+
+
+def rejected(name: str) -> bool:
+    """Last response said quota rejected, and no window has reset since."""
+    info = STATE["accounts"].get(name, {})
+    if info.get("status") != "rejected":
+        return False
+    now, seen = time.time(), info.get("last_seen", 0)
+    return not any(info.get(k) and seen < info[k] <= now for k in ("reset_5h", "reset_7d"))
+
+
+def hard_ok(name: str) -> bool:
+    """Can still serve a request at all: not disabled, under the hard limit in
+    both windows, not currently rejected."""
+    return (not disabled(name) and not rejected(name)
+            and utilization(name) < HARD_LIMIT and util_7d(name) < HARD_LIMIT)
+
+
+def binding_reset(name: str) -> float:
+    """Reset time of the window with the least room left — when the account's
+    remaining capacity stops being the bottleneck (or is lost, if unused)."""
+    info = STATE["accounts"].get(name, {})
+    room_5h = HARD_LIMIT - utilization(name)
+    room_7d = HARD_LIMIT - util_7d(name)
+    key = "reset_5h" if room_5h <= room_7d else "reset_7d"
+    return info.get(key) or float("inf")
+
+
+def reserve_spendable(name: str) -> bool:
+    """In the reserve band (over a threshold, under the hard limit) and every
+    window holding it there resets within its spend horizon: that reserve is
+    about to be lost unused, so spend it now."""
+    if not hard_ok(name) or under_threshold(name):
+        return False
+    info, now = STATE["accounts"].get(name, {}), time.time()
+    for util, thr, key, horizon in (
+            (utilization(name), THRESHOLD, "reset_5h", RESERVE_SPEND_5H_S),
+            (util_7d(name), THRESHOLD_7D, "reset_7d", RESERVE_SPEND_7D_S)):
+        if util >= thr and not (info.get(key) and info[key] - now <= horizon):
+            return False
+    return True
+
+
+def usable(name: str) -> bool:
+    """Normal traffic may go here: under both thresholds, or reserve that is
+    about to expire."""
+    return under_threshold(name) or reserve_spendable(name)
 
 
 def weekly_reset(name: str) -> float:
@@ -201,21 +255,34 @@ def pick_account() -> str:
     accounts that still have 5h session room; ties broken by lower 5h use.
     weekly-pace: highest weekly_pace() — the account whose remaining weekly
     quota is likeliest to expire unused; ties broken by lower 5h use.
-    If nothing is usable: the non-disabled account whose 5h window resets
+    Within a tier, reserve about to expire (reserve_spendable) goes first,
+    soonest reset first — it is lost otherwise.
+    Emergency (nothing usable): the reserve band — any hard_ok account, the one
+    whose binding window resets soonest, so traffic runs to the real limit
+    instead of stopping at the thresholds.
+    If nothing is hard_ok: the non-disabled account whose 5h window resets
     soonest, skipping week-exhausted accounts (a 5h reset doesn't help them);
     if every account is week-exhausted, the one whose weekly window resets soonest.
     """
     under = [n for n in ACCOUNTS if usable(n)]
     if under:
         if STRATEGY == "consume-first":
-            return min(under, key=lambda n: (priority(n), weekly_reset(n), utilization(n)))
-        if STRATEGY == "most-weekly-left":
-            return min(under, key=lambda n: (priority(n), util_7d(n), utilization(n)))
-        if STRATEGY == "weekly-pace":
-            return min(under, key=lambda n: (priority(n), -weekly_pace(n), utilization(n)))
-        return min(under, key=lambda n: (priority(n), utilization(n)))
+            key = lambda n: (weekly_reset(n), utilization(n))
+        elif STRATEGY == "most-weekly-left":
+            key = lambda n: (util_7d(n), utilization(n))
+        elif STRATEGY == "weekly-pace":
+            key = lambda n: (-weekly_pace(n), utilization(n))
+        else:
+            key = lambda n: (utilization(n),)
+        return min(under, key=lambda n: (
+            priority(n),
+            (0, binding_reset(n)) if reserve_spendable(n) else (1, 0),
+            key(n)))
+    reserve = [n for n in ACCOUNTS if hard_ok(n)]
+    if reserve:
+        return min(reserve, key=lambda n: (priority(n), binding_reset(n)))
     pool = [n for n in ACCOUNTS if not disabled(n)] or list(ACCOUNTS)
-    week_ok = [n for n in pool if util_7d(n) < THRESHOLD_7D]
+    week_ok = [n for n in pool if util_7d(n) < HARD_LIMIT]
     if week_ok:
         return min(week_ok, key=lambda n: STATE["accounts"].get(n, {}).get("reset_5h", 0))
     return min(pool, key=weekly_reset)
@@ -268,7 +335,7 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
             verdict = "switched" if quota_hit else None
         else:
             cooled = now - STATE.get("last_switch_ts", 0) >= COOLDOWN_S
-            over = utilization(account) >= THRESHOLD or util_7d(account) >= THRESHOLD_7D
+            over = not usable(account)  # expiring reserve is being spent on purpose
             nxt = pick_account()
             reason = None
             if nxt != account:
@@ -276,19 +343,26 @@ async def note_response(account: str, headers: httpx.Headers, status: int) -> st
                     reason = "quota_exhausted"  # hard stop: no cooldown, no margin
                 elif disabled(account):
                     reason = "account_disabled"  # hard rule: leave immediately
-                elif over and cooled:
+                elif over and cooled and (usable(nxt) or not hard_ok(account)):
                     # Hysteresis: only move to a meaningfully better account, so
                     # two accounts hovering at the line never ping-pong. A move
-                    # to a preferred tier, or off a week-exhausted account,
-                    # skips the margin.
+                    # to a preferred tier, off a week-exhausted account, or onto
+                    # expiring reserve skips the margin. If nxt is itself only
+                    # reserve (emergency), stay put: the active account keeps
+                    # its warm cache until it is actually rejected.
                     if (util_7d(account) >= THRESHOLD_7D
                             or priority(nxt) < priority(account)
+                            or reserve_spendable(nxt)
                             or utilization(nxt) <= utilization(account) - SWITCH_MARGIN):
                         reason = f"utilization>={THRESHOLD}"
-                elif cooled and usable(nxt):
+                elif cooled and usable(nxt) and not over:
                     if priority(nxt) < priority(account):
                         # A preferred account has room again — pull traffic back.
                         reason = "priority_recovery"
+                    elif reserve_spendable(nxt) and not reserve_spendable(account):
+                        # Another account's last few % reset soon — spend them
+                        # before they are lost; come back when it is rejected.
+                        reason = "reserve_expiring"
                     elif (STRATEGY == "consume-first"
                           and weekly_reset(nxt) < weekly_reset(account) - CF_MARGIN_S):
                         # Use-it-or-lose-it: proactively jump to an account whose
@@ -369,11 +443,14 @@ async def rotate_status(request: Request):
             info["reset_7d_in_h"] = max(0, round((info["reset_7d"] - now) / 3600, 1))
         info["weekly_pace_pct_per_h"] = round(weekly_pace(name) * 100, 3)
         info["fresh_session"] = fresh_session(name)
+        info["hard_ok"] = hard_ok(name)
+        info["reserve_spendable"] = reserve_spendable(name)
         accounts[name] = info
     return {
         "active_account": STATE["active_account"],
         "switch_threshold": THRESHOLD,
         "switch_threshold_7d": THRESHOLD_7D,
+        "hard_limit": HARD_LIMIT,
         "strategy": STRATEGY,
         "hold_max_s": HOLD_MAX_S,
         "accounts": accounts,
